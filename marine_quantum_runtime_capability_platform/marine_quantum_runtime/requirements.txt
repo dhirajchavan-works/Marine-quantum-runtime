@@ -1,0 +1,33 @@
+# marine_quantum_runtime
+# No external dependencies required for core runtime.
+# All modules use Python standard library only.
+#
+# Python >= 3.8
+#
+# Standard library used:
+#   math        — sqrt() for sigma, pi for angle normalisation
+#   hashlib     — SHA-256 for all IDs and hash chains
+#   json        — canonical serialisation (sort_keys=True)
+#   dataclasses — @dataclass(frozen=True) for QAppExecutionEnvelope
+#   datetime    — deterministic timestamps (no datetime.now() in core)
+#   sys         — path management, exit codes
+#   os          — path resolution
+#   io          — UTF-8 stdout on Windows
+#   random      — Phase 7 shuffle proof only (not in core logic)
+#   typing      — type hints
+#
+# ── Optional (full quantum circuit execution) ────────────────────────
+# Uncomment to enable live Qiskit AerSimulator execution:
+#
+# qiskit>=1.0.0
+# qiskit-aer>=0.14.0
+# pydantic>=1.10.0,<3
+#
+# Install with:
+#   pip install qiskit qiskit-aer pydantic
+#
+# The runtime degrades gracefully without these packages.
+# src/quantum/execution.py uses a deterministic classical stub
+# when qiskit is not available.
+#
+# ── No other external dependencies. No pip installs required. ────────
