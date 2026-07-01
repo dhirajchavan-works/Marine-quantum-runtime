@@ -1,32 +1,20 @@
 # src/runtime/capability_runtime.py
 # Runtime Capability Platform — Invocation Surface
-# Phase 3: Production Runtime Integration
-#
-# This module wraps the existing invoke_runtime dispatch table through:
-#   1. RuntimeCapabilityRegistry  — capability discovery + attachment validation
-#   2. RuntimeObservabilityLayer  — invocation recording + metrics
+# UPDATED:
+#   - Real CanonicalReplayAuthority wired by default (not stub)
+#   - PersistentHistory wired for EvidenceLedger (not in-memory-only stub)
+#   - Per-capability SequenceRegistry (not global seq counter)
+#   - Typed attachment validation
+#   - Dependency graph check before every invocation
+#   - Authority matrix check before every invocation
 #
 # PUBLIC API:
-#   invoke_capability(capability_id: str, payload: dict) -> dict
+#   invoke_capability(capability_id, payload) -> dict
 #   get_active_capabilities() -> list[dict]
 #   get_runtime_health() -> dict
-#   get_execution_timeline() -> dict
-#   get_latency_metrics() -> dict
-#   get_capability_availability() -> dict
-#   get_dashboard_json() -> dict        ← Phase 4: Dashboard Capability Surface
-#   get_replay_statistics() -> dict     ← Phase 4: Replay stats placeholder
-#   get_provenance_status() -> dict     ← Phase 4: Provenance status placeholder
-#
-# Integration posture:
-#   Replay authority    — consumed from CanonicalReplayAuthority (Pritesh layer); never decided locally.
-#   Provenance          — ExecutionRecord emitted; never owned locally.
-#   Optimization        — attachment surface only; no optimization logic inside runtime.
-#
-# Rules:
-#   No datetime.now() anywhere.
-#   All invocation IDs are SHA-256 deterministic.
-#   Observability is append-only.
-#   This module does NOT replace invoke_runtime.py — it wraps it.
+#   get_dashboard_json() -> dict
+#   attach_replay_authority(authority) -> None
+#   attach_evidence_ledger(ledger) -> None
 
 import hashlib
 import json
@@ -35,34 +23,56 @@ import os
 import time
 from typing import Any, Dict, List, Optional
 
-# Path resolution — callable from any working directory
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from src.runtime.runtime_capability_registry import (
-    discover_capability,
-    list_capabilities,
-    get_capability_health,
-    get_registry_summary,
-    validate_attachment,
-    record_invocation_result,
-    RegistryError,
-    CapabilityNotFound,
+    discover_capability, list_capabilities, get_registry_summary,
+    validate_attachment, validate_dependency_graph, record_invocation_result,
+    RegistryError, CapabilityNotFound,
 )
 from src.runtime.runtime_observability import (
-    record_invocation,
-    get_runtime_health,
-    get_execution_history,
-    get_capability_metrics,
-    get_runtime_summary,
-    get_runtime_heartbeat,
-    next_seq,
-    InvocationRecord,
-    make_invocation_id,
-    make_payload_hash,
-    make_output_hash,
+    record_invocation, get_runtime_health, get_execution_history,
+    get_capability_metrics, get_runtime_summary, get_runtime_heartbeat,
+    InvocationRecord, make_invocation_id, make_payload_hash, make_output_hash,
 )
+from src.runtime.sequence_registry import SequenceRegistry
+from src.runtime.persistent_history import PersistentHistory
+from src.governance.replay_legitimacy import CanonicalReplayAuthority
+from src.governance.authority_matrix import check as authority_check, check_execution
+
+
+# ── Per-capability sequence registry ──────────────────────────────────────────
+_SEQ_REGISTRY = SequenceRegistry()
+
+
+def _next_seq(capability_id: str) -> int:
+    return _SEQ_REGISTRY.next(capability_id)
+
+
+# ── Replay Authority (real implementation, not stub) ──────────────────────────
+_replay_authority: Any = CanonicalReplayAuthority(allow_re_execution=True)
+# allow_re_execution=True for development; set False in production via attach_replay_authority()
+
+
+def attach_replay_authority(authority: Any) -> None:
+    """
+    Attach a CanonicalReplayAuthority instance.
+    Use CanonicalReplayAuthority(allow_re_execution=False) for production.
+    """
+    global _replay_authority
+    _replay_authority = authority
+
+
+# ── Evidence Ledger (persistent, not in-memory-only stub) ─────────────────────
+_evidence_ledger: Any = PersistentHistory()
+
+
+def attach_evidence_ledger(ledger: Any) -> None:
+    """Attach an alternative evidence ledger (must implement append(record))."""
+    global _evidence_ledger
+    _evidence_ledger = ledger
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -75,131 +85,95 @@ def _canonical(obj: Any) -> str:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"))
 
 
-# ── Replay Authority Stub ─────────────────────────────────────────────────────
-# The runtime consumes replay authority — it never makes replay decisions.
-# When Pritesh's CanonicalReplayAuthority is attached, this stub is replaced.
-
-class _CanonicalReplayAuthorityStub:
-    """
-    Placeholder for Pritesh's CanonicalReplayAuthority.
-    The runtime calls this before every execution.
-    Returns PERMIT unless overridden by the real authority.
-    """
-    def check(self, capability_id: str, payload: dict) -> dict:
-        return {
-            "authority":    "CanonicalReplayAuthority",
-            "decision":     "PERMIT",
-            "reason":       "stub — attach real authority via attach_replay_authority()",
-            "capability_id": capability_id,
-        }
-
-
-_replay_authority = _CanonicalReplayAuthorityStub()
-
-
-def attach_replay_authority(authority: Any) -> None:
-    """
-    Attach Pritesh's CanonicalReplayAuthority.
-    The authority must implement: check(capability_id, payload) -> dict
-    with a 'decision' key of 'PERMIT' or 'DENY'.
-    """
-    global _replay_authority
-    _replay_authority = authority
-
-
-# ── Provenance Stub ───────────────────────────────────────────────────────────
-# The runtime emits execution records — it never owns provenance.
-
-class _EvidenceLedgerStub:
-    """
-    Placeholder for Pritesh's EvidenceLedger.
-    Collects execution records locally until the real ledger is attached.
-    """
-    def __init__(self) -> None:
-        self._records: List[dict] = []
-
-    def append(self, record: dict) -> None:
-        self._records.append(record)
-
-    def get_records(self) -> List[dict]:
-        return list(self._records)
-
-    def count(self) -> int:
-        return len(self._records)
-
-
-_evidence_ledger = _EvidenceLedgerStub()
-
-
-def attach_evidence_ledger(ledger: Any) -> None:
-    """
-    Attach Pritesh's EvidenceLedger.
-    The ledger must implement: append(record: dict) -> None
-    """
-    global _evidence_ledger
-    _evidence_ledger = ledger
-
-
 # ── Core Invocation ───────────────────────────────────────────────────────────
 
 def invoke_capability(capability_id: str, payload: dict) -> dict:
     """
-    Invoke a registered capability through the full capability platform stack:
+    Invoke a registered capability through the full capability platform stack.
 
-        Attachment Validation
+    Pipeline:
+        Capability Discovery
               ↓
-        Replay Authority Check
+        Dependency Graph Validation  ← NEW: ensures dependencies are registered
               ↓
-        Runtime Execution (via invoke_runtime dispatch)
+        Authority Matrix Check       ← NEW: enforce ceiling before execution
               ↓
-        Execution Evidence Emission
+        Typed Attachment Validation  ← UPDATED: checks types + bounds
+              ↓
+        Replay Authority Check       ← REAL: CanonicalReplayAuthority
+              ↓
+        Runtime Execution
+              ↓
+        Evidence Emission            ← PERSISTENT: survives restarts
               ↓
         Observability Recording
               ↓
         Return to Caller
-
-    Args:
-        capability_id : str  — registered capability ID
-        payload       : dict — capability-specific input
-
-    Returns:
-        dict with keys:
-            status, capability_id, invocation_id, deterministic_hash,
-            duration_ms, output, errors, replay_authority, provenance_ref
     """
     t0  = time.perf_counter()
-    seq = next_seq()
+    seq = _next_seq(capability_id)
 
     # 1. Discover capability
     try:
         descriptor = discover_capability(capability_id)
     except CapabilityNotFound as exc:
+        return {"status": "CAPABILITY_NOT_FOUND", "capability_id": capability_id,
+                "errors": [str(exc)]}
+
+    # 2. Dependency graph validation (NEW)
+    dep_check = validate_dependency_graph(capability_id)
+    if not dep_check["valid"]:
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        err = (f"DependencyError: capability '{capability_id}' has unregistered dependencies: "
+               f"{dep_check['missing_dependencies']}")
+        _emit_record(capability_id, seq, payload, None, "DEPENDENCY_ERROR", err, elapsed_ms)
         return {
-            "status":        "CAPABILITY_NOT_FOUND",
-            "capability_id": capability_id,
-            "errors":        [str(exc)],
+            "status":           "DEPENDENCY_ERROR",
+            "capability_id":    capability_id,
+            "invocation_id":    make_invocation_id(capability_id, seq, payload),
+            "errors":           [err],
+            "dependency_check": dep_check,
         }
 
-    # 2. Attachment validation — inputs must satisfy declared contract
+    # 3. Authority matrix check (NEW) — checks this capability's right to EXECUTE
+    #    itself, not its right to invoke OTHER capabilities (different action).
+    auth_result = check_execution(capability_id)
+    if not auth_result.permitted:
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        err = f"AuthorityViolation: {auth_result.reason}"
+        _emit_record(capability_id, seq, payload, None, "AUTHORITY_DENIED", err, elapsed_ms)
+        return {
+            "status":        "AUTHORITY_DENIED",
+            "capability_id": capability_id,
+            "invocation_id": make_invocation_id(capability_id, seq, payload),
+            "errors":        [err],
+            "authority":     auth_result.to_dict(),
+        }
+
+    # 4. Typed attachment validation (UPDATED)
     attachment = validate_attachment(capability_id, payload)
     if not attachment["valid"]:
         elapsed_ms = (time.perf_counter() - t0) * 1000
-        err = f"AttachmentViolation: missing inputs {attachment['missing']} for capability '{capability_id}'"
-        _emit_invocation_record(capability_id, seq, payload, None, "VALIDATION_ERROR", err, elapsed_ms)
+        missing    = attachment.get("missing", [])
+        type_errs  = attachment.get("type_errors", [])
+        all_errors = [f"Missing: {missing}"] if missing else []
+        all_errors += type_errs
+        err = f"AttachmentViolation: {'; '.join(all_errors)}"
+        _emit_record(capability_id, seq, payload, None, "VALIDATION_ERROR", err, elapsed_ms)
         return {
             "status":           "VALIDATION_ERROR",
             "capability_id":    capability_id,
             "invocation_id":    make_invocation_id(capability_id, seq, payload),
-            "errors":           [err],
+            "errors":           all_errors,
             "attachment_check": attachment,
         }
 
-    # 3. Replay authority check — consume, never decide
+    # 5. Replay authority check (REAL implementation)
     replay_decision = _replay_authority.check(capability_id, payload)
     if replay_decision.get("decision") != "PERMIT":
         elapsed_ms = (time.perf_counter() - t0) * 1000
-        err = f"ReplayAuthority DENY: {replay_decision.get('reason', 'no reason given')}"
-        _emit_invocation_record(capability_id, seq, payload, None, "REPLAY_DENIED", err, elapsed_ms)
+        err = f"ReplayAuthority DENY: {replay_decision.get('reason', 'no reason')}"
+        _emit_record(capability_id, seq, payload, None, "REPLAY_DENIED", err, elapsed_ms)
         return {
             "status":           "REPLAY_DENIED",
             "capability_id":    capability_id,
@@ -208,15 +182,14 @@ def invoke_capability(capability_id: str, payload: dict) -> dict:
             "errors":           [err],
         }
 
-    # 4. Execute via existing invoke_runtime dispatch
+    # 6. Execute
     try:
-        # Import the existing dispatch — capability platform wraps it, doesn't replace it
         import invoke_runtime as _ir
         inner_result = _ir.invoke_runtime(capability_id, payload)
     except Exception as exc:
         elapsed_ms = (time.perf_counter() - t0) * 1000
         err = f"ExecutionError: {exc}"
-        _emit_invocation_record(capability_id, seq, payload, None, "FAILED", err, elapsed_ms)
+        _emit_record(capability_id, seq, payload, None, "FAILED", err, elapsed_ms)
         record_invocation_result(capability_id, success=False, error=err)
         return {
             "status":        "FAILED",
@@ -228,10 +201,16 @@ def invoke_capability(capability_id: str, payload: dict) -> dict:
     elapsed_ms = (time.perf_counter() - t0) * 1000
     succeeded  = inner_result.get("status") == "SUCCESS"
     errors     = inner_result.get("errors", [])
-    output     = inner_result.get("output")
+    output     = inner_result.get("result") or inner_result.get("output")
 
-    # 5. Emit execution evidence (consumed by Pritesh's provenance layer)
+    # 7. Record truth hash in replay authority
     invocation_id = make_invocation_id(capability_id, seq, payload)
+    if succeeded and output is not None:
+        output_hash = make_output_hash(output)
+        if hasattr(_replay_authority, "record_truth"):
+            _replay_authority.record_truth(invocation_id, output_hash)
+
+    # 8. Emit persistent evidence
     evidence_record = {
         "invocation_id":      invocation_id,
         "capability_id":      capability_id,
@@ -239,7 +218,7 @@ def invoke_capability(capability_id: str, payload: dict) -> dict:
         "owner":              descriptor.owner,
         "seq":                seq,
         "status":             "SUCCESS" if succeeded else "FAILED",
-        "deterministic_hash": inner_result.get("deterministic_hash", ""),
+        "deterministic_hash": _sha256(_canonical(output)) if output else "",
         "payload_hash":       make_payload_hash(payload),
         "output_hash":        make_output_hash(output) if output else "",
         "duration_ms":        round(elapsed_ms, 3),
@@ -247,38 +226,32 @@ def invoke_capability(capability_id: str, payload: dict) -> dict:
     }
     _evidence_ledger.append(evidence_record)
 
-    # 6. Record to observability layer
+    # 9. Observability
     status_str = "SUCCESS" if succeeded else "FAILED"
-    _emit_invocation_record(
-        capability_id, seq, payload, output,
-        status_str, errors[0] if errors else None, elapsed_ms
-    )
-    record_invocation_result(capability_id, success=succeeded, error=errors[0] if errors else None)
+    _emit_record(capability_id, seq, payload, output, status_str,
+                 errors[0] if errors else None, elapsed_ms)
+    record_invocation_result(capability_id, success=succeeded,
+                             error=errors[0] if errors else None)
 
-    # 7. Assemble and return
-    result = {
+    return {
         "status":             status_str,
         "capability_id":      capability_id,
         "invocation_id":      invocation_id,
-        "deterministic_hash": inner_result.get("deterministic_hash", ""),
+        "deterministic_hash": _sha256(_canonical(output)) if output else "",
         "duration_ms":        round(elapsed_ms, 3),
         "output":             output,
         "errors":             errors,
         "replay_authority":   replay_decision,
-        "provenance_ref":     invocation_id,    # reference key for Pritesh's ledger
+        "provenance_ref":     invocation_id,
         "metrics":            inner_result.get("metrics", {}),
+        "dependency_check":   dep_check,
+        "authority_check":    auth_result.to_dict(),
     }
-    return result
 
 
-def _emit_invocation_record(
-    capability_id: str,
-    seq:           int,
-    payload:       dict,
-    output:        Any,
-    status:        str,
-    error:         Optional[str],
-    duration_ms:   float,
+def _emit_record(
+    capability_id: str, seq: int, payload: dict,
+    output: Any, status: str, error: Optional[str], duration_ms: float,
 ) -> None:
     record = InvocationRecord(
         invocation_id = make_invocation_id(capability_id, seq, payload),
@@ -293,13 +266,9 @@ def _emit_invocation_record(
     record_invocation(record)
 
 
-# ── Phase 4: Dashboard Capability Surface APIs ────────────────────────────────
+# ── Dashboard APIs ────────────────────────────────────────────────────────────
 
 def get_active_capabilities() -> List[dict]:
-    """
-    List all registered capabilities with their current health.
-    Dashboard-ready JSON.
-    """
     caps    = list_capabilities()
     metrics = get_capability_metrics()
     for cap in caps:
@@ -309,7 +278,6 @@ def get_active_capabilities() -> List[dict]:
 
 
 def get_latency_metrics() -> dict:
-    """Per-capability latency metrics. Dashboard-ready JSON."""
     raw = get_capability_metrics()
     return {
         cid: {
@@ -322,10 +290,6 @@ def get_latency_metrics() -> dict:
 
 
 def get_capability_availability() -> dict:
-    """
-    Current availability status for each registered capability.
-    AVAILABLE | DEGRADED | UNAVAILABLE | IDLE
-    """
     caps    = list_capabilities()
     metrics = get_capability_metrics()
     result  = {}
@@ -341,54 +305,52 @@ def get_capability_availability() -> dict:
 
 
 def get_replay_statistics() -> dict:
-    """
-    Replay statistics surface — consumed from Pritesh's CanonicalReplayAuthority.
-    Returns stub data until the real authority is attached.
-    """
+    if hasattr(_replay_authority, "statistics"):
+        stats = _replay_authority.statistics()
+        return {**stats, "stub": False}
     return {
         "replay_authority": "CanonicalReplayAuthority",
         "authority_status": "STUB — attach via attach_replay_authority()",
         "permits_issued":   "N/A",
         "denials_issued":   "N/A",
-        "note": "This runtime consumes replay authority. It does not own it.",
+        "stub":             True,
     }
 
 
 def get_provenance_status() -> dict:
-    """
-    Provenance status — execution evidence emitted to Pritesh's EvidenceLedger.
-    Returns count of records buffered in local stub until real ledger is attached.
-    """
-    return {
-        "evidence_ledger":  "EvidenceLedger",
-        "ledger_status":    "STUB — attach via attach_evidence_ledger()",
-        "records_buffered": _evidence_ledger.count(),
-        "note": "This runtime emits execution evidence. It does not own provenance.",
-    }
+    if hasattr(_evidence_ledger, "summary"):
+        summ = _evidence_ledger.summary()
+        return {**summ, "stub": False, "persistent": True}
+    if hasattr(_evidence_ledger, "count"):
+        return {
+            "records_buffered": _evidence_ledger.count(),
+            "persistent":       False,
+            "stub":             True,
+        }
+    return {"stub": True, "persistent": False}
+
+
+def get_dependency_graph_status() -> dict:
+    from src.runtime.runtime_capability_registry import validate_dependency_graph_all
+    return validate_dependency_graph_all()
+
+
+def get_conflict_status() -> dict:
+    from src.runtime.runtime_capability_registry import detect_conflicts
+    return detect_conflicts()
 
 
 def get_dashboard_json() -> dict:
-    """
-    Complete dashboard-ready JSON output — Phase 4 primary endpoint.
-
-    Aggregates:
-        - active_capabilities
-        - runtime_health
-        - execution_timeline (last 20)
-        - latency_metrics
-        - capability_availability
-        - replay_statistics
-        - provenance_status
-        - registry_summary
-    """
     return {
-        "active_capabilities":   get_active_capabilities(),
-        "runtime_health":        get_runtime_health(),
-        "execution_timeline":    get_execution_history(limit=20),
-        "latency_metrics":       get_latency_metrics(),
+        "active_capabilities":     get_active_capabilities(),
+        "runtime_health":          get_runtime_health(),
+        "execution_timeline":      get_execution_history(limit=20),
+        "latency_metrics":         get_latency_metrics(),
         "capability_availability": get_capability_availability(),
-        "replay_statistics":     get_replay_statistics(),
-        "provenance_status":     get_provenance_status(),
-        "registry_summary":      get_registry_summary(),
-        "runtime_heartbeat":     get_runtime_heartbeat(),
+        "replay_statistics":       get_replay_statistics(),
+        "provenance_status":       get_provenance_status(),
+        "registry_summary":        get_registry_summary(),
+        "runtime_heartbeat":       get_runtime_heartbeat(),
+        "dependency_graph":        get_dependency_graph_status(),
+        "conflict_detection":      get_conflict_status(),
     }
