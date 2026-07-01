@@ -1,33 +1,25 @@
-# marine_quantum_runtime
-# No external dependencies required for core runtime.
-# All modules use Python standard library only.
+# marine_quantum_runtime — Quantum Runtime Capability
+# BHIV Ecosystem | Marine Intelligence System
 #
 # Python >= 3.8
 #
-# Standard library used:
-#   math        — sqrt() for sigma, pi for angle normalisation
-#   hashlib     — SHA-256 for all IDs and hash chains
-#   json        — canonical serialisation (sort_keys=True)
-#   dataclasses — @dataclass(frozen=True) for QAppExecutionEnvelope
-#   datetime    — deterministic timestamps (no datetime.now() in core)
-#   sys         — path management, exit codes
-#   os          — path resolution
-#   io          — UTF-8 stdout on Windows
-#   random      — Phase 7 shuffle proof only (not in core logic)
-#   typing      — type hints
+# CORE RUNTIME (no external dependencies — stdlib only):
+#   All 4 original entry points (run_signal, run_quantum_pipeline,
+#   run_distributed_qapp, run_operational_drift) run with zero installs.
+#   The governance layer (run_governance, 46 checks) also requires no installs.
 #
-# ── Optional (full quantum circuit execution) ────────────────────────
-# Uncomment to enable live Qiskit AerSimulator execution:
+# RECOMMENDED (real Aer simulation — tested and confirmed working):
+qiskit>=1.0.0
+qiskit-aer>=0.14.0
 #
-# qiskit>=1.0.0
-# qiskit-aer>=0.14.0
-# pydantic>=1.10.0,<3
+# OPTIONAL (for IBM Runtime execution — requires IBM_QUANTUM_TOKEN):
+# qiskit-ibm-runtime>=0.20.0
 #
-# Install with:
-#   pip install qiskit qiskit-aer pydantic
+# INSTALL (development / CI):
+#   pip install qiskit qiskit-aer --break-system-packages
 #
-# The runtime degrades gracefully without these packages.
-# src/quantum/execution.py uses a deterministic classical stub
-# when qiskit is not available.
-#
-# ── No other external dependencies. No pip installs required. ────────
+# No other external dependencies. No databases. No message brokers.
+# The ecosystem integration test (run_ecosystem_integration.py, 33 checks)
+# requires qiskit + qiskit-aer for Phase 7.3 (Aer determinism) and Phase 7.4b
+# (identical execution surface proof). Without them it falls through to
+# local_simulator for those checks and the Aer-specific assertions fail.
